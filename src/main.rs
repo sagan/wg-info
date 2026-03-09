@@ -10,7 +10,7 @@ use std::thread;
 #[command(
     name = "wg-info",
     about = "Wireguard Info\n==============\n\nThis tool enhances the output of 'wg show' to include node names.\nAlso it can ping the nodes (using the first ip in AllowedIPs)\nand indicate the online status via red/green color coding.\n\nIt expects you to use wg-quick and reads the wg-quick config at\n/etc/wireguard/INTERFACE.conf\n\nThe human readable peer names are expected in the wg-quick config \nwithin a comment like this:\n[Peer]\n# Name = Very secret node in antarctica",
-    version = "v0.1.1",
+    version,
     long_about = None
 )]
 struct Cli {
