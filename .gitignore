@@ -1,1 +1,3 @@
 /target
+# By default ignore all files in root dir
+/*.*

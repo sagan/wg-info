@@ -1,15 +1,19 @@
 # wg-info (Rust version)
 
 This is the Rust port of [wg-info](https://codeberg.org/aylen384/wg-info) Python script,
-which displays wireguard status with each peer's name. For your convenience,
-this port version also displays the wg interface's self ip by parsing `ip addr show dev wg0` output.
+which displays wireguard status with each peer's name.
 
-Written by Gemini 3.1 Pro.
+It has several improvements compared to the original Python script:
+
+- Displays the wg interface's self ip by parsing `ip addr show dev wg0` output.
+- Add a `-P` flag to test whether the wg interface MTU is OK by sending ICMP packets with different payload sizes.
+
+Written by Gemini 3.1 Pro, Google Antigravity.
 
 ## Usage
 
 ```
-# ./wg-info -h
+# ./wg-info  -h
 Wireguard Info
 ==============
 
@@ -30,7 +34,8 @@ Usage: wg-info [OPTIONS]
 Options:
       --html                   Format output as HTML
       --tty                    Force terminal colors even when writing to pipe
-  -p, --ping                   Ping all nodes (in parallel) and show online status
+  -p, --ping                   Ping all nodes (in parallel) and show online status. It uses system ping command
+  -P, --ping-mtu               Ping all peers with max payload size based on interface MTU, and show the actual MTU This will also show the MTU status for the interface. It uses raw sockets to ping
   -i, --interface <INTERFACE>  Only show status for this interface
   -f, --filter <FILTER>        Filter peers by name or allowed ips
   -h, --help                   Print help
