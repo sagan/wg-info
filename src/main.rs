@@ -1,9 +1,10 @@
 use clap::Parser;
 use regex::Regex;
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, IsTerminal};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -105,7 +106,72 @@ impl Colors {
     }
 }
 
+fn select_best_ip(allowed_ips: &str, iface_has_v4: bool, iface_has_v6: bool) -> String {
+    let mut best_ip = String::new();
+    let mut best_score = 0;
+
+    for token in allowed_ips.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let mut parts = token.split('/');
+        let ip_str = parts.next().unwrap_or("").trim();
+        let prefix_len: Option<u8> = parts.next().and_then(|s| s.trim().parse().ok());
+
+        if let Ok(ip) = IpAddr::from_str(ip_str) {
+            if ip.is_unspecified() {
+                continue;
+            }
+
+            let is_host = match (ip, prefix_len) {
+                (IpAddr::V4(_), Some(32)) | (IpAddr::V4(_), None) => true,
+                (IpAddr::V6(_), Some(128)) | (IpAddr::V6(_), None) => true,
+                _ => false,
+            };
+
+            let is_default_route = prefix_len == Some(0);
+
+            let mut score = if is_host {
+                30
+            } else if !is_default_route {
+                20
+            } else {
+                10
+            };
+
+            match ip {
+                IpAddr::V4(_) if iface_has_v4 => score += 5,
+                IpAddr::V6(_) if iface_has_v6 => score += 5,
+                _ => {}
+            }
+
+            if score > best_score {
+                best_score = score;
+                best_ip = ip_str.to_string();
+            }
+        }
+    }
+
+    if best_ip.is_empty() {
+        let first = allowed_ips.split(',').next().unwrap_or("").trim();
+        best_ip = first.split('/').next().unwrap_or("").trim().to_string();
+    }
+
+    best_ip
+}
+
 fn read_config(interface: &str, peers: &mut HashMap<String, PeerInfo>) {
+    let iface_ips = get_interface_ips(interface);
+    let has_v4 = iface_ips.iter().any(|ip| {
+        let raw = ip.split('/').next().unwrap_or("");
+        Ipv4Addr::from_str(raw).is_ok()
+    });
+    let has_v6 = iface_ips.iter().any(|ip| {
+        let raw = ip.split('/').next().unwrap_or("");
+        Ipv6Addr::from_str(raw).is_ok()
+    });
+
     let path = format!("/etc/wireguard/{}.conf", interface);
     let Ok(file) = File::open(&path) else { return };
     let reader = BufReader::new(file);
@@ -113,7 +179,7 @@ fn read_config(interface: &str, peers: &mut HashMap<String, PeerInfo>) {
     let mut peer_section = false;
     let mut peer_name = String::from("*nameless*");
     let mut peer_pubkey = String::new();
-    let mut peer_ip = String::new();
+    let mut peer_allowed_ips = Vec::new();
 
     let re_name = Regex::new(r"^#?\s*Name").unwrap();
 
@@ -121,11 +187,12 @@ fn read_config(interface: &str, peers: &mut HashMap<String, PeerInfo>) {
         let line = line.trim();
         if line == "[Peer]" {
             if peer_section && !peer_pubkey.is_empty() {
+                let peer_ip = select_best_ip(&peer_allowed_ips.join(", "), has_v4, has_v6);
                 peers.insert(
                     peer_pubkey.clone(),
                     PeerInfo {
                         name: peer_name.clone(),
-                        ip: peer_ip.clone(),
+                        ip: peer_ip,
                         online: true,
                         interface: interface.to_string(),
                         actual_mtu: None,
@@ -133,7 +200,7 @@ fn read_config(interface: &str, peers: &mut HashMap<String, PeerInfo>) {
                 );
                 peer_name = String::from("*nameless*");
                 peer_pubkey.clear();
-                peer_ip.clear();
+                peer_allowed_ips.clear();
             }
             peer_section = true;
             continue;
@@ -144,15 +211,15 @@ fn read_config(interface: &str, peers: &mut HashMap<String, PeerInfo>) {
                 peer_pubkey = line.splitn(2, '=').nth(1).unwrap_or("").trim().to_string();
             } else if re_name.is_match(line) {
                 peer_name = line.splitn(2, '=').nth(1).unwrap_or("").trim().to_string();
-            } else if line.starts_with("AllowedIPs") && peer_ip.is_empty() {
+            } else if line.starts_with("AllowedIPs") {
                 let ips = line.splitn(2, '=').nth(1).unwrap_or("").trim();
-                let first_ip = ips.split(',').next().unwrap_or("").trim();
-                peer_ip = first_ip.split('/').next().unwrap_or("").trim().to_string();
+                peer_allowed_ips.push(ips.to_string());
             }
         }
     }
 
     if peer_section && !peer_pubkey.is_empty() {
+        let peer_ip = select_best_ip(&peer_allowed_ips.join(", "), has_v4, has_v6);
         peers.insert(
             peer_pubkey,
             PeerInfo {
@@ -163,6 +230,53 @@ fn read_config(interface: &str, peers: &mut HashMap<String, PeerInfo>) {
                 actual_mtu: None,
             },
         );
+    }
+}
+
+fn update_peers_from_wg(interface: &str, peers: &mut HashMap<String, PeerInfo>) {
+    let iface_ips = get_interface_ips(interface);
+    let has_v4 = iface_ips.iter().any(|ip| {
+        let raw = ip.split('/').next().unwrap_or("");
+        Ipv4Addr::from_str(raw).is_ok()
+    });
+    let has_v6 = iface_ips.iter().any(|ip| {
+        let raw = ip.split('/').next().unwrap_or("");
+        Ipv6Addr::from_str(raw).is_ok()
+    });
+
+    let Ok(output) = Command::new("wg")
+        .args(["show", interface, "dump"])
+        .output()
+    else {
+        return;
+    };
+    let out_str = String::from_utf8_lossy(&output.stdout);
+    for (i, line) in out_str.lines().enumerate() {
+        if i == 0 {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 4 {
+            let pubkey = parts[0].trim().to_string();
+            let allowed_ips = parts[3].trim();
+            let best_ip = select_best_ip(allowed_ips, has_v4, has_v6);
+            if let Some(info) = peers.get_mut(&pubkey) {
+                if (info.ip.is_empty() || info.ip == "0.0.0.0" || info.ip == "::") && !best_ip.is_empty() {
+                    info.ip = best_ip;
+                }
+            } else if !pubkey.is_empty() {
+                peers.insert(
+                    pubkey,
+                    PeerInfo {
+                        name: String::from("*nameless*"),
+                        ip: best_ip,
+                        online: true,
+                        interface: interface.to_string(),
+                        actual_mtu: None,
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -216,12 +330,7 @@ fn checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-fn ping_raw_mtu(ip: &str, mtu: usize, ident: u16) -> bool {
-    let ipv4 = match Ipv4Addr::from_str(ip) {
-        Ok(ip) => ip,
-        Err(_) => return false,
-    };
-
+fn ping_raw_mtu_ipv4(ipv4: Ipv4Addr, mtu: usize, ident: u16, interface: &str) -> bool {
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP) };
     if fd < 0 {
         return false;
@@ -247,6 +356,20 @@ fn ping_raw_mtu(ip: &str, mtu: usize, ident: u16) -> bool {
             &tv as *const _ as *const libc::c_void,
             std::mem::size_of_val(&tv) as libc::socklen_t,
         );
+    }
+
+    if !interface.is_empty() {
+        if let Ok(ifname) = CString::new(interface) {
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
+                    ifname.as_ptr() as *const libc::c_void,
+                    ifname.as_bytes_with_nul().len() as libc::socklen_t,
+                );
+            }
+        }
     }
 
     let payload_size = mtu.saturating_sub(28);
@@ -332,6 +455,199 @@ fn ping_raw_mtu(ip: &str, mtu: usize, ident: u16) -> bool {
 
     unsafe { libc::close(fd) };
     false
+}
+
+fn ping_raw_mtu_ipv6(ipv6: Ipv6Addr, mtu: usize, ident: u16, interface: &str) -> bool {
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_ICMPV6) };
+    if fd < 0 {
+        return false;
+    }
+
+    let pmtu = libc::IPV6_PMTUDISC_DO;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MTU_DISCOVER,
+            &pmtu as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&pmtu) as libc::socklen_t,
+        );
+    }
+
+    let dontfrag = 1i32;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_DONTFRAG,
+            &dontfrag as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&dontfrag) as libc::socklen_t,
+        );
+    }
+
+    let tv = libc::timeval { tv_sec: 1, tv_usec: 0 };
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&tv) as libc::socklen_t,
+        );
+    }
+
+    let ifname = CString::new(interface).unwrap_or_default();
+    let ifindex = unsafe { libc::if_nametoindex(ifname.as_ptr()) };
+
+    if !interface.is_empty() {
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                ifname.as_ptr() as *const libc::c_void,
+                ifname.as_bytes_with_nul().len() as libc::socklen_t,
+            );
+        }
+    }
+
+    // IPv6 fixed header is 40 bytes, ICMPv6 header is 8 bytes -> 48 bytes overhead
+    let payload_size = mtu.saturating_sub(48);
+    let packet_size = 8 + payload_size;
+    let mut packet = vec![0u8; packet_size];
+    // ICMPv6 Echo Request: Type 128, Code 0
+    packet[0] = 128;
+    packet[1] = 0;
+    // For AF_INET6 IPPROTO_ICMPV6 raw sockets, RFC 3542 / Linux requires checksum field
+    // to be set to 0 before sendto; kernel calculates and inserts the checksum.
+    packet[2] = 0;
+    packet[3] = 0;
+    packet[4] = (ident >> 8) as u8;
+    packet[5] = (ident & 0xff) as u8;
+    packet[6] = 0;
+    packet[7] = 1;
+
+    for i in 8..packet_size {
+        packet[i] = (i & 0xff) as u8;
+    }
+
+    let scope_id = if ipv6.is_unicast_link_local() {
+        ifindex
+    } else {
+        0
+    };
+
+    let dest = libc::sockaddr_in6 {
+        sin6_family: libc::AF_INET6 as libc::sa_family_t,
+        sin6_port: 0,
+        sin6_flowinfo: 0,
+        sin6_addr: libc::in6_addr {
+            s6_addr: ipv6.octets(),
+        },
+        sin6_scope_id: scope_id,
+    };
+
+    let sent = unsafe {
+        libc::sendto(
+            fd,
+            packet.as_ptr() as *const libc::c_void,
+            packet.len(),
+            0,
+            &dest as *const _ as *const libc::sockaddr,
+            std::mem::size_of_val(&dest) as libc::socklen_t,
+        )
+    };
+
+    if sent < 0 {
+        unsafe { libc::close(fd) };
+        return false;
+    }
+
+    let mut recv_buf = vec![0u8; 65536];
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed().as_secs() >= 1 {
+            break;
+        }
+
+        let n = unsafe {
+            libc::recvfrom(
+                fd,
+                recv_buf.as_mut_ptr() as *mut libc::c_void,
+                recv_buf.len(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+
+        if n > 0 {
+            let n = n as usize;
+            // On Linux AF_INET6 SOCK_RAW IPPROTO_ICMPV6, recvfrom returns the ICMPv6 packet directly
+            if n >= 8 {
+                let icmp6_type = recv_buf[0];
+                if icmp6_type == 129 {
+                    // Echo Reply
+                    let recv_ident = ((recv_buf[4] as u16) << 8) | (recv_buf[5] as u16);
+                    if recv_ident == ident {
+                        unsafe { libc::close(fd) };
+                        return true;
+                    }
+                }
+            }
+        } else {
+            break;
+        }
+    }
+
+    unsafe { libc::close(fd) };
+    false
+}
+
+fn ping_raw_mtu(ip: &str, mtu: usize, ident: u16, interface: &str) -> bool {
+    if let Ok(ipv4) = Ipv4Addr::from_str(ip) {
+        ping_raw_mtu_ipv4(ipv4, mtu, ident, interface)
+    } else if let Ok(ipv6) = Ipv6Addr::from_str(ip) {
+        ping_raw_mtu_ipv6(ipv6, mtu, ident, interface)
+    } else {
+        false
+    }
+}
+
+fn run_ping(interface: &str, ip: &str) -> bool {
+    let try_cmd = |cmd_name: &str, args: &[&str]| -> bool {
+        Command::new(cmd_name)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+
+    if let Ok(IpAddr::V6(v6)) = IpAddr::from_str(ip) {
+        if v6.is_unicast_link_local() {
+            // IPv6 link-local addresses require an interface scope
+            if try_cmd("ping", &["-c1", "-W1", "-I", interface, ip]) {
+                return true;
+            }
+            try_cmd("ping6", &["-c1", "-W1", "-I", interface, ip])
+        } else {
+            // For other IPv6 addresses, try standard ping, then with -I interface, then ping6
+            if try_cmd("ping", &["-c1", "-W1", ip]) {
+                return true;
+            }
+            if try_cmd("ping", &["-c1", "-W1", "-I", interface, ip]) {
+                return true;
+            }
+            if try_cmd("ping6", &["-c1", "-W1", ip]) {
+                return true;
+            }
+            try_cmd("ping6", &["-c1", "-W1", "-I", interface, ip])
+        }
+    } else {
+        try_cmd("ping", &["-c1", "-W1", ip])
+    }
 }
 
 fn get_interface_ips(interface: &str) -> Vec<String> {
@@ -597,6 +913,7 @@ fn main() {
 
     for interface in &interfaces {
         read_config(interface, &mut peers);
+        update_peers_from_wg(interface, &mut peers);
     }
 
     if cli.ping || cli.ping_mtu {
@@ -620,24 +937,28 @@ fn main() {
             // Provide a default MTU in case extracting MTU failed or interface was somehow missed.
             let expected_mtu = interface_mtus.get(&info.interface).copied().unwrap_or(1500);
             let ident_counter = ident_counter.clone();
+            let interface = info.interface.clone();
 
             if ip.is_empty() {
                 continue;
             }
 
             thread::spawn(move || {
+                let is_ipv6 = matches!(IpAddr::from_str(&ip), Ok(IpAddr::V6(_)));
+                let min_mtu = if is_ipv6 { 1280 } else { 1200 };
+
                 let (online, actual_mtu) = if is_ping_mtu {
-                    if ping_raw_mtu(&ip, expected_mtu, ident_counter.fetch_add(1, Ordering::SeqCst)) {
+                    if ping_raw_mtu(&ip, expected_mtu, ident_counter.fetch_add(1, Ordering::SeqCst), &interface) {
                         (true, Some(expected_mtu))
-                    } else if !ping_raw_mtu(&ip, 1200, ident_counter.fetch_add(1, Ordering::SeqCst)) {
-                        (false, None)
-                    } else {
-                        let mut low = 1201;
+                    } else if expected_mtu > min_mtu
+                        && ping_raw_mtu(&ip, min_mtu, ident_counter.fetch_add(1, Ordering::SeqCst), &interface)
+                    {
+                        let mut low = min_mtu + 1;
                         let mut high = expected_mtu - 1;
-                        let mut max_working = 1200;
+                        let mut max_working = min_mtu;
                         while low <= high {
                             let mid = low + (high - low) / 2;
-                            if ping_raw_mtu(&ip, mid, ident_counter.fetch_add(1, Ordering::SeqCst)) {
+                            if ping_raw_mtu(&ip, mid, ident_counter.fetch_add(1, Ordering::SeqCst), &interface) {
                                 max_working = mid;
                                 low = mid + 1;
                             } else {
@@ -645,14 +966,12 @@ fn main() {
                             }
                         }
                         (true, Some(max_working))
+                    } else {
+                        (false, None)
                     }
                 } else {
-                    let status = Command::new("ping")
-                        .args(["-c1", "-W1", &ip])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                    (status.map(|s| s.success()).unwrap_or(false), None)
+                    let online = run_ping(&interface, &ip);
+                    (online, None)
                 };
                 let _ = tx.send((pubkey, online, actual_mtu));
             });
@@ -680,5 +999,47 @@ fn main() {
 
     if cli.html {
         println!("</pre>");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_select_best_ip_ipv6() {
+        let allowed_ips = "fe80::c0a8:8edc/128, 0.0.0.0/0, ::/0";
+        let best = select_best_ip(allowed_ips, false, true);
+        assert_eq!(best, "fe80::c0a8:8edc");
+
+        let reversed = "0.0.0.0/0, ::/0, fe80::c0a8:8edc/128";
+        let best_rev = select_best_ip(reversed, false, true);
+        assert_eq!(best_rev, "fe80::c0a8:8edc");
+    }
+
+    #[test]
+    fn test_select_best_ip_ipv4() {
+        let allowed_ips = "0.0.0.0/0, 10.0.0.2/32";
+        let best = select_best_ip(allowed_ips, true, false);
+        assert_eq!(best, "10.0.0.2");
+    }
+
+    #[test]
+    fn test_select_best_ip_dual_stack() {
+        let allowed_ips = "10.0.0.2/32, fd00::2/128";
+        // If interface only has IPv6
+        let best_v6 = select_best_ip(allowed_ips, false, true);
+        assert_eq!(best_v6, "fd00::2");
+
+        // If interface only has IPv4
+        let best_v4 = select_best_ip(allowed_ips, true, false);
+        assert_eq!(best_v4, "10.0.0.2");
+    }
+
+    #[test]
+    fn test_checksum() {
+        let data = [8u8, 0, 0, 0, 1, 2, 0, 1];
+        let c = checksum(&data);
+        assert!(c != 0);
     }
 }
