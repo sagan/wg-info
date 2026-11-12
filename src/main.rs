@@ -300,16 +300,20 @@ fn get_up_interfaces(interfaces: &[String]) -> Vec<String> {
     up
 }
 
-fn get_interface_mtu(interface: &str) -> Option<usize> {
-    let output = Command::new("ip").args(["addr", "show", "dev", interface]).output().ok()?;
-    let out_str = String::from_utf8_lossy(&output.stdout);
+fn parse_mtu_from_ip_output(output: &str) -> Option<usize> {
     let re = Regex::new(r"mtu\s+(\d+)").unwrap();
-    if let Some(caps) = re.captures(&out_str) {
+    if let Some(caps) = re.captures(output) {
         if let Ok(mtu) = caps[1].parse::<usize>() {
             return Some(mtu);
         }
     }
     None
+}
+
+fn get_interface_mtu(interface: &str) -> Option<usize> {
+    let output = Command::new("ip").args(["addr", "show", "dev", interface]).output().ok()?;
+    let out_str = String::from_utf8_lossy(&output.stdout);
+    parse_mtu_from_ip_output(&out_str)
 }
 
 fn checksum(data: &[u8]) -> u16 {
@@ -751,12 +755,25 @@ fn show_info(
             );
 
             let ips = get_interface_ips(iface);
+            let mtu_opt = get_interface_mtu(iface);
             if !ips.is_empty() {
-                println!("  {}address{}: {}", colors.bld, colors.end, ips.join(", "));
+                if let Some(mtu) = mtu_opt {
+                    println!(
+                        "  {}address{}: {} (mtu: {})",
+                        colors.bld,
+                        colors.end,
+                        ips.join(", "),
+                        mtu
+                    );
+                } else {
+                    println!("  {}address{}: {}", colors.bld, colors.end, ips.join(", "));
+                }
+            } else if let Some(mtu) = mtu_opt {
+                println!("  {}mtu{}: {}", colors.bld, colors.end, mtu);
             }
 
             if is_ping_mtu {
-                let expected_mtu = get_interface_mtu(iface).unwrap_or(1500);
+                let expected_mtu = mtu_opt.unwrap_or(1500);
 
                 let mut online_mtus = Vec::new();
                 for info in peers.values() {
@@ -1041,5 +1058,14 @@ mod tests {
         let data = [8u8, 0, 0, 0, 1, 2, 0, 1];
         let c = checksum(&data);
         assert!(c != 0);
+    }
+
+    #[test]
+    fn test_parse_mtu_from_ip_output() {
+        let output = "85: wg42node243: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 qdisc noqueue state UNKNOWN group default qlen 1000\n    link/none\n    inet6 fe80::ac18:3f0/64 scope link\n       valid_lft forever preferred_lft forever";
+        assert_eq!(parse_mtu_from_ip_output(output), Some(1420));
+
+        let output_no_mtu = "some output without mtu info";
+        assert_eq!(parse_mtu_from_ip_output(output_no_mtu), None);
     }
 }

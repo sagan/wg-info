@@ -5,7 +5,7 @@ which displays wireguard status with each peer's name.
 
 It has several improvements compared to the original Python script:
 
-- Displays the wg interface's self ip by parsing `ip addr show dev wg0` output.
+- Displays the wg interface's self ip and MTU by parsing `ip addr show dev wg0` output.
 - Add a `-P` flag to test whether the wg interface MTU is OK by sending ICMP packets with different payload sizes.
 
 Written by Gemini 3.1 Pro, Google Antigravity.
